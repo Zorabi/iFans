@@ -103,4 +103,6 @@ A: Apple Silicon 设备可能暴露上百个温度 SMC 键。iFan 首次识别�
 
 ## License
 
-MIT
+本 Fork 作为整体依据 [GNU Affero General Public License v3.0](LICENSE) 发布。任何通过网络向用户提供本软件功能的修改版本，也必须向这些用户提供对应源代码。
+
+源自 [chansss/iFans](https://github.com/chansss/iFans) 的上游代码仍保留原作者的 MIT 版权与许可声明，详见 [LICENSE-MIT](LICENSE-MIT)。
