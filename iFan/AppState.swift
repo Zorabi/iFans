@@ -15,6 +15,8 @@ final class AppState: ObservableObject {
     private let reader = SensorReader()
     private var timer: Timer?
 
+    private let monitoringInterval: TimeInterval = 2
+
     private let policiesKey = "ifan.policies.v1"
     private let currentKey = "ifan.currentPolicy.v1"
 
@@ -36,7 +38,7 @@ final class AppState: ObservableObject {
         // Re-assert the last selected policy to the daemon on launch.
         pushCurrentToDaemon()
         timer?.invalidate()
-        let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+        let t = Timer(timeInterval: monitoringInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
         RunLoop.main.add(t, forMode: .common)
@@ -44,7 +46,7 @@ final class AppState: ObservableObject {
     }
 
     func refresh() {
-        if let snap = reader?.read() {
+        if let snap = reader?.read(cachedTemperatureSensors: snapshot.temperatureSensors) {
             snapshot = snap
         }
         // Keep the daemon's watchdog fed while a manual policy is active.

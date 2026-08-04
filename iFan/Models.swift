@@ -27,11 +27,21 @@ struct FanPolicy: Identifiable, Codable, Equatable {
     ]
 }
 
+/// A live reading from one temperature-related SMC key.
+struct TemperatureSensorReading: Identifiable, Equatable {
+    var id: String { key }
+    let key: String
+    let value: Double
+    let category: String
+}
+
 /// One reading of all monitored sensors.
 struct SensorSnapshot {
     // CPU
     var cpuTemp: Double?      // average CPU core die temperature (°C)
     var cpuMaxTemp: Double?   // hottest CPU core die temperature (°C)
+    var cpuHotspotKey: String? // SMC key currently reporting the hotspot
+    var cpuSensorCount: Int = 0
 
     // GPU
     var gpuTemp: Double?      // average GPU die temperature (°C)
@@ -39,6 +49,9 @@ struct SensorSnapshot {
 
     // Chassis
     var chassisTemp: Double?  // keyboard / palm-rest area temperature (°C)
+
+    // All valid temperature-related SMC readings, hottest first.
+    var temperatureSensors: [TemperatureSensorReading] = []
 
     // Fans
     var leftRPM: Double?      // fan 0 actual RPM

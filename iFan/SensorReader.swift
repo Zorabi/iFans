@@ -7,6 +7,13 @@ final class SensorReader {
     private let allCPUTempKeys: [String]
     private let allGPUTempKeys: [String]
     private let chassisKeys: [String]
+    private let summaryTemperatureKeys: [String]
+    private let backgroundTemperatureKeys: [String]
+    private var backgroundTemperatureOffset = 0
+
+    private let backgroundTemperatureBatchSize: Int
+    private let keyInfoCacheName: String
+    private var persistedKeyInfoEntries: [String: String]
 
     private let modelDisplayName: String
     private let modelYearStr: String
@@ -19,42 +26,83 @@ final class SensorReader {
         guard let smc = SMC() else { return nil }
         self.smc = smc
 
-        let allKeys = smc.allKeyNames()
+        let identifier = SensorReader.getModelIdentifier()
+        let smcKeyCacheName = "ifan.smc.keys.v1.\(identifier)"
+        let temperatureKeyCacheName = "ifan.smc.temperatureKeys.v1.\(identifier)"
+        let keyInfoCacheName = "ifan.smc.keyInfo.v1.\(identifier)"
+        let persistedKeyInfoEntries = (
+            UserDefaults.standard.dictionary(forKey: keyInfoCacheName) ?? [:]
+        ).compactMapValues { $0 as? String }
+        smc.restoreKeyInfoCache(persistedKeyInfoEntries)
+        self.keyInfoCacheName = keyInfoCacheName
+        self.persistedKeyInfoEntries = persistedKeyInfoEntries
 
-        // CPU
-        var cpuKeys = allKeys.filter { $0.hasPrefix("TPD") || $0.hasPrefix("TRD") }
-        if cpuKeys.isEmpty {
-            for k in ["pACC","eACC","PC0C","PC0R","PC1C","PC2R","PC3R","PC4R","PC5R","PCAM","PCBC","PCBR"] {
-                if let v = smc.readValue(k), v > 0, v < 130 { cpuKeys.append(k) }
-            }
+        let cachedKeys = UserDefaults.standard.stringArray(forKey: smcKeyCacheName) ?? []
+        let allKeys: [String]
+        if cachedKeys.isEmpty {
+            allKeys = smc.allKeyNames()
+            UserDefaults.standard.set(allKeys, forKey: smcKeyCacheName)
+        } else {
+            allKeys = cachedKeys
         }
-        self.allCPUTempKeys = cpuKeys
+
+        // Temperature SMC keys conventionally begin with T and use either
+        // Apple's fixed-point temperature type or a floating-point value.
+        // Keep the full typed list so the UI can expose every valid sensor.
+        let cachedTemperatureKeys = UserDefaults.standard.stringArray(forKey: temperatureKeyCacheName) ?? []
+        let temperatureKeys: [String]
+        if cachedTemperatureKeys.isEmpty {
+            temperatureKeys = allKeys.filter { key in
+                guard key.hasPrefix("T") else { return false }
+                let type = smc.keyInfo(key).type
+                return type == "sp78" || type == "flt"
+            }.sorted()
+            UserDefaults.standard.set(temperatureKeys, forKey: temperatureKeyCacheName)
+        } else {
+            temperatureKeys = cachedTemperatureKeys
+        }
+        // CPU — Apple Silicon exposes per-core / hotspot sensors through
+        // generation-specific prefixes. Tp* and TC* are the important M1/M2
+        // families; Te*/Tf* cover newer generations. Prefer these granular
+        // readings over the lower aggregate TPD*/TRD* values.
+        let granularPrefixes = ["Tp", "TC", "Te", "Tf"]
+        var cpuKeys = temperatureKeys.filter { key in
+            granularPrefixes.contains { key.hasPrefix($0) }
+        }
+
+        // Some models only expose aggregate CPU die sensors.
+        if cpuKeys.isEmpty {
+            cpuKeys = temperatureKeys.filter { $0.hasPrefix("TPD") || $0.hasPrefix("TRD") }
+        }
+        self.allCPUTempKeys = Array(Set(cpuKeys)).sorted()
 
         // GPU — known patterns
         let knownGPU = ["TG0D","TG0E","TG0p","TG0h","TG0P","TG0d",
                         "TG1D","TG1E","TG1p","TG1h","TG1P","TG1d",
                         "TG2D","TG0F","TG1F","TG0G","TG1G"]
-        var gpuKeys: [String] = []
-        for k in knownGPU {
-            if let v = smc.readValue(k), v > 0, v < 130 { gpuKeys.append(k) }
-        }
+        let temperatureKeySet = Set(temperatureKeys)
+        var gpuKeys = knownGPU.filter { temperatureKeySet.contains($0) }
         if gpuKeys.isEmpty {
-            for k in allKeys where k.hasPrefix("TG") {
-                if let v = smc.readValue(k), v > 0, v < 130 { gpuKeys.append(k) }
-            }
+            gpuKeys = temperatureKeys.filter { $0.hasPrefix("TG") }
         }
         self.allGPUTempKeys = gpuKeys
 
         // Chassis
         let candidates = ["TC0P","TC1P","Ts0P","Ts1P","TB0T","TH0a","TH0b","TH0x"]
-        var foundChassis: [String] = []
-        for k in candidates {
-            if let v = smc.readValue(k), v > 0, v < 130 { foundChassis.append(k) }
-        }
+        let foundChassis = candidates.filter { temperatureKeySet.contains($0) }
         self.chassisKeys = foundChassis
+        let summaryTemperatureKeys = Array(Set(cpuKeys + gpuKeys + foundChassis)).sorted()
+        self.summaryTemperatureKeys = summaryTemperatureKeys
+        let summaryTemperatureKeySet = Set(summaryTemperatureKeys)
+        self.backgroundTemperatureKeys = temperatureKeys.filter {
+            !summaryTemperatureKeySet.contains($0)
+        }
+        let hasCompleteKeyInfoCache = temperatureKeys.allSatisfy {
+            persistedKeyInfoEntries[$0] != nil
+        }
+        self.backgroundTemperatureBatchSize = hasCompleteKeyInfoCache ? 8 : 4
 
         // Model
-        let identifier = SensorReader.getModelIdentifier()
         (self.modelDisplayName, self.modelYearStr) = SensorReader.parseModel(identifier)
 
         // Fan
@@ -79,26 +127,54 @@ final class SensorReader {
         if bat != 0 { IOObjectRelease(bat) }
         self.cachedBattery = hasBattery ? SensorReader.readBattery() : nil
 
+        // A fresh model discovery already queried each temperature key's
+        // metadata. Save those results now; existing installs fill the same
+        // cache incrementally during the first rolling sensor pass.
+        persistKeyInfoMetadata(for: temperatureKeys)
     }
 
-    func read() -> SensorSnapshot {
+    func read(cachedTemperatureSensors: [TemperatureSensorReading] = []) -> SensorSnapshot {
         var snap = SensorSnapshot()
 
-        // CPU
-        var cpuTemps: [Double] = []
-        for key in allCPUTempKeys {
-            if let v = smc.readValue(key), v > 0, v < 130 { cpuTemps.append(v) }
+        let keysToRead = Array(Set(summaryTemperatureKeys + nextBackgroundTemperatureBatch())).sorted()
+        let liveTemperatureReadings = keysToRead.compactMap { key -> TemperatureSensorReading? in
+            guard let value = smc.readValue(key), SensorReader.isValidTemperature(value) else {
+                return nil
+            }
+            return TemperatureSensorReading(
+                key: key,
+                value: value,
+                category: SensorReader.temperatureCategory(for: key)
+            )
         }
-        if !cpuTemps.isEmpty {
-            snap.cpuTemp = cpuTemps.reduce(0, +) / Double(cpuTemps.count)
-            snap.cpuMaxTemp = cpuTemps.max()
+        persistKeyInfoMetadata(for: keysToRead)
+        let liveTemperaturesByKey = Dictionary(
+            uniqueKeysWithValues: liveTemperatureReadings.map { ($0.key, $0) }
+        )
+
+        var displayTemperaturesByKey = Dictionary(
+            uniqueKeysWithValues: cachedTemperatureSensors.map { ($0.key, $0) }
+        )
+        for key in keysToRead {
+            displayTemperaturesByKey[key] = liveTemperaturesByKey[key]
+        }
+        snap.temperatureSensors = displayTemperaturesByKey.values.sorted {
+            $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value
+        }
+
+        // CPU
+        let cpuReadings = allCPUTempKeys.compactMap { liveTemperaturesByKey[$0] }
+        if !cpuReadings.isEmpty {
+            snap.cpuTemp = cpuReadings.reduce(0) { $0 + $1.value } / Double(cpuReadings.count)
+            if let hotspot = cpuReadings.max(by: { $0.value < $1.value }) {
+                snap.cpuMaxTemp = hotspot.value
+                snap.cpuHotspotKey = hotspot.key
+            }
+            snap.cpuSensorCount = cpuReadings.count
         }
 
         // GPU
-        var gpuTemps: [Double] = []
-        for key in allGPUTempKeys {
-            if let v = smc.readValue(key), v > 0, v < 130 { gpuTemps.append(v) }
-        }
+        let gpuTemps = allGPUTempKeys.compactMap { liveTemperaturesByKey[$0]?.value }
         if !gpuTemps.isEmpty {
             snap.gpuTemp = gpuTemps.reduce(0, +) / Double(gpuTemps.count)
             snap.gpuMaxTemp = gpuTemps.max()
@@ -106,8 +182,8 @@ final class SensorReader {
 
         // Chassis
         for key in chassisKeys {
-            if let v = smc.readValue(key), v > 0, v < 130 {
-                snap.chassisTemp = v
+            if let reading = liveTemperaturesByKey[key] {
+                snap.chassisTemp = reading.value
                 break
             }
         }
@@ -136,7 +212,49 @@ final class SensorReader {
         return snap
     }
 
+    private func nextBackgroundTemperatureBatch() -> [String] {
+        guard !backgroundTemperatureKeys.isEmpty else { return [] }
+
+        let batchCount = min(backgroundTemperatureBatchSize, backgroundTemperatureKeys.count)
+        let batch = (0..<batchCount).map { index in
+            backgroundTemperatureKeys[(backgroundTemperatureOffset + index) % backgroundTemperatureKeys.count]
+        }
+        backgroundTemperatureOffset = (backgroundTemperatureOffset + batchCount) % backgroundTemperatureKeys.count
+        return batch
+    }
+
+    private func persistKeyInfoMetadata(for keys: [String]) {
+        let discoveredEntries = smc.cachedKeyInfoEntries(for: keys)
+        var changed = false
+        for (key, encoded) in discoveredEntries where persistedKeyInfoEntries[key] != encoded {
+            persistedKeyInfoEntries[key] = encoded
+            changed = true
+        }
+        if changed {
+            UserDefaults.standard.set(persistedKeyInfoEntries, forKey: keyInfoCacheName)
+        }
+    }
+
     // MARK: - Model
+
+    private static func isValidTemperature(_ value: Double) -> Bool {
+        value > 0 && value < 130
+    }
+
+    private static func temperatureCategory(for key: String) -> String {
+        if key.hasPrefix("Tp") || key.hasPrefix("TC") || key.hasPrefix("Te") ||
+            key.hasPrefix("Tf") || key.hasPrefix("TPD") || key.hasPrefix("TRD") {
+            return "CPU"
+        }
+        if key.hasPrefix("Tg") || key.hasPrefix("TG") { return "GPU" }
+        if key.hasPrefix("TB") { return "电池" }
+        if key.hasPrefix("Tm") || key.hasPrefix("TM") { return "内存" }
+        if key.hasPrefix("Ts") || key.hasPrefix("TH") || key.hasPrefix("TN") ||
+            key.hasPrefix("TW") || key.hasPrefix("TA") || key.hasPrefix("TL") {
+            return "机身"
+        }
+        return "SoC / 其他"
+    }
 
     private static func getModelIdentifier() -> String {
         var size = 0

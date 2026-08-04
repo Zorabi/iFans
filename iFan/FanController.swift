@@ -26,6 +26,7 @@ enum FanController {
 
     private static let watchdogTimeout: TimeInterval = 8
     /// If no heartbeat for this long, the daemon exits entirely (doesn't linger).
+    private static let manualReassertInterval: TimeInterval = 30
 
     // MARK: - Daemon entry
 
@@ -66,7 +67,7 @@ enum FanController {
 
         var lastModeManual: Bool? = nil
         var lastTargets: [Double] = [-1, -1]
-        var lastDetailLog = Date.distantPast
+        var lastManualWrite = Date.distantPast
 
         while gStopRequested == 0 {
             let cmd = readCommand()
@@ -78,22 +79,26 @@ enum FanController {
                     min(max(cmd.left,  fanMin[0]), fanMax[0]),
                     min(max(cmd.right, fanMin[1]), fanMax[1]),
                 ]
-                var outcomes: [String] = []
-
-                if hasFtst {
-                    outcomes.append("Ftst=1:\(smc.writeUInt8("Ftst", 1).description)")
-                }
-                for i in 0..<2 { _ = smc.writeUInt8(modeKeys[i], 0) }
-                for i in 0..<2 { outcomes.append("\(modeKeys[i])=1:\(smc.writeUInt8(modeKeys[i], 1).description)") }
-                for i in 0..<2 { outcomes.append("\(tgKeys[i])=\(Int(targets[i])):\(smc.writeFloat(tgKeys[i], Float(targets[i])).description)") }
-
                 let changed = (lastModeManual != true) || lastTargets != targets
-                if changed || Date().timeIntervalSince(lastDetailLog) > 30 {
+                let shouldWrite = changed || Date().timeIntervalSince(lastManualWrite) >= manualReassertInterval
+
+                if shouldWrite {
+                    var outcomes: [String] = []
+                    if hasFtst {
+                        outcomes.append("Ftst=1:\(smc.writeUInt8("Ftst", 1).description)")
+                    }
+                    for i in 0..<2 {
+                        outcomes.append("\(modeKeys[i])=1:\(smc.writeUInt8(modeKeys[i], 1).description)")
+                    }
+                    for i in 0..<2 {
+                        outcomes.append("\(tgKeys[i])=\(Int(targets[i])):\(smc.writeFloat(tgKeys[i], Float(targets[i])).description)")
+                    }
+
                     let rbMode = smc.readValue(modeKeys[0]).map { Int($0) } ?? -1
                     let rbAc0 = smc.readValue("F0Ac").map { Int($0) } ?? -1
                     let rbAc1 = smc.readValue("F1Ac").map { Int($0) } ?? -1
                     log("MANUAL L=\(Int(targets[0])) R=\(Int(targets[1])) | \(outcomes.joined(separator: " ")) | readback \(modeKeys[0])=\(rbMode) F0Ac=\(rbAc0) F1Ac=\(rbAc1)")
-                    lastDetailLog = Date()
+                    lastManualWrite = Date()
                 }
                 lastModeManual = true
                 lastTargets = targets
@@ -105,6 +110,7 @@ enum FanController {
                     log("AUTO restored (\(reason))")
                     lastModeManual = false
                     lastTargets = [-1, -1]
+                    lastManualWrite = .distantPast
                 }
 
             }
@@ -244,8 +250,15 @@ enum FanController {
     }
 
     static func touchHeartbeat() {
-        let stamp = "\(Date().timeIntervalSince1970)"
-        try? stamp.write(toFile: FanPaths.heartbeatFile, atomically: true, encoding: .utf8)
+        let fileManager = FileManager.default
+        if fileManager.fileExists(atPath: FanPaths.heartbeatFile) {
+            try? fileManager.setAttributes(
+                [.modificationDate: Date()],
+                ofItemAtPath: FanPaths.heartbeatFile
+            )
+        } else {
+            fileManager.createFile(atPath: FanPaths.heartbeatFile, contents: Data())
+        }
     }
 
     static func readLog() -> String {

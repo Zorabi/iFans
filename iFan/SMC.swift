@@ -55,6 +55,7 @@ final class SMC {
     // MARK: - Connection
 
     private var conn: io_connect_t = 0
+    private var keyInfoCache: [String: (size: UInt32, type: String)] = [:]
 
     init?() {
         let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC"))
@@ -92,11 +93,46 @@ final class SMC {
     }
 
     func keyInfo(_ key: String) -> (size: UInt32, type: String) {
+        if let cached = keyInfoCache[key] { return cached }
+
         var input = SMCParamStruct()
         input.key = SMC.fourCharToUInt32(key)
         input.data8 = Cmd.keyInfo
         let out = call(&input).out
-        return (out.keyInfo.dataSize, SMC.uint32ToFourChar(out.keyInfo.dataType).trimmingCharacters(in: .whitespaces))
+        let info = (
+            size: out.keyInfo.dataSize,
+            type: SMC.uint32ToFourChar(out.keyInfo.dataType).trimmingCharacters(in: .whitespaces)
+        )
+        keyInfoCache[key] = info
+        return info
+    }
+
+    /// Restores metadata discovered by an earlier app run. SMC key layout is
+    /// stable for a given model, so this avoids another key-info IOKit call
+    /// before every sensor's first value read after relaunch.
+    func restoreKeyInfoCache(_ entries: [String: String]) {
+        for (key, encoded) in entries {
+            let parts = encoded.split(separator: ",", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2,
+                  let size = UInt32(parts[0]),
+                  size > 0,
+                  size <= 32,
+                  !parts[1].isEmpty else { continue }
+            keyInfoCache[key] = (size: size, type: String(parts[1]))
+        }
+    }
+
+    /// Exports only metadata that has already been queried in this process;
+    /// this method never performs additional IOKit calls.
+    func cachedKeyInfoEntries(for keys: [String]) -> [String: String] {
+        var entries: [String: String] = [:]
+        entries.reserveCapacity(keys.count)
+        for key in keys {
+            if let info = keyInfoCache[key], info.size > 0, !info.type.isEmpty {
+                entries[key] = "\(info.size),\(info.type)"
+            }
+        }
+        return entries
     }
 
     private func readRaw(_ key: String, size: UInt32) -> [UInt8] {

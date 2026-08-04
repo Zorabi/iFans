@@ -1,9 +1,19 @@
 import SwiftUI
 
+private struct TemperatureSensorGroup: Identifiable {
+    let name: String
+    let sensors: [TemperatureSensorReading]
+
+    var id: String { name }
+    var average: Double { sensors.reduce(0) { $0 + $1.value } / Double(sensors.count) }
+    var hottest: TemperatureSensorReading? { sensors.max { $0.value < $1.value } }
+}
+
 struct MainWindowView: View {
     @EnvironmentObject var state: AppState
     @State private var showingAdd = false
     @State private var showingLog = false
+    @State private var showingAllTemperatureSensors = false
     @State private var draggingPolicyID: UUID?
 
     var body: some View {
@@ -197,18 +207,15 @@ struct MainWindowView: View {
         ScrollView {
             VStack(spacing: 0) {
                 VStack(spacing: 12) {
-                    tempCardWide(
-                        icon: "cpu",
-                        title: "CPU 温度",
-                        temp: state.snapshot.cpuTemp,
-                        subtitle: state.snapshot.cpuMaxTemp.map { String(format: "最高 %.1f°C", $0) } ?? "最高 --°C"
-                    )
+                    cpuTemperatureCard
 
                     tempCardWide(
                         icon: "keyboard",
                         title: "机身温度 (键盘区域)",
                         temp: state.snapshot.chassisTemp
                     )
+
+                    allTemperatureSensorsSection
                 }
                 .padding(20)
 
@@ -267,6 +274,64 @@ struct MainWindowView: View {
 
     // MARK: - Temperature card (wide)
 
+    private var cpuTemperatureCard: some View {
+        let snap = state.snapshot
+
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "cpu")
+                    .font(.title3)
+                    .foregroundStyle(tempColor(snap.cpuMaxTemp ?? snap.cpuTemp))
+                Text("CPU 温度")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text(snap.cpuSensorCount > 0 ? "\(snap.cpuSensorCount) 个核心 / 热点传感器" : "未检测到传感器")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+
+            HStack(spacing: 14) {
+                cpuTemperatureMetric(label: "平均", temp: snap.cpuTemp)
+                    .frame(maxWidth: .infinity)
+
+                Divider()
+                    .frame(height: 42)
+
+                cpuTemperatureMetric(label: "热点", temp: snap.cpuMaxTemp, source: snap.cpuHotspotKey)
+                    .frame(maxWidth: .infinity)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity)
+        .background(RoundedRectangle(cornerRadius: 10).fill(.quaternary.opacity(0.4)))
+        .accessibilityElement(children: .combine)
+    }
+
+    private func cpuTemperatureMetric(label: String, temp: Double?, source: String? = nil) -> some View {
+        HStack(alignment: .center, spacing: 6) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if let source {
+                    Text("来源 \(source)")
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+
+            Spacer(minLength: 4)
+
+            Text(temp.map { String(format: "%.1f°C", $0) } ?? "--°C")
+                .font(.system(size: 24, weight: .bold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(tempColor(temp))
+        }
+        .frame(minHeight: 42, alignment: .center)
+    }
+
     private func tempCardWide(icon: String, title: String, temp: Double?, subtitle: String = "") -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 12) {
@@ -305,6 +370,172 @@ struct MainWindowView: View {
         case 55..<75: return .orange
         default:     return .red
         }
+    }
+
+    // MARK: - All temperature sensors
+
+    private var allTemperatureSensorsSection: some View {
+        let sensors = state.snapshot.temperatureSensors
+        let groups = temperatureSensorGroups(sensors)
+
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "thermometer.medium")
+                    .foregroundStyle(.secondary)
+                Text("温度传感器概览")
+                    .font(.subheadline.weight(.medium))
+                Spacer()
+                Text(sensors.isEmpty ? "未检测到" : "共 \(sensors.count) 个")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+
+            LazyVGrid(
+                columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3),
+                spacing: 8
+            ) {
+                ForEach(groups) { group in
+                    temperatureGroupCard(group)
+                }
+            }
+
+            Text("分类依据 SMC 键名推断；未公开含义的键归入「SoC / 其他」。")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+
+            Divider()
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    showingAllTemperatureSensors.toggle()
+                }
+            } label: {
+                HStack {
+                    Text("原始传感器明细（组内按温度降序）")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Image(systemName: showingAllTemperatureSensors ? "chevron.up" : "chevron.down")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if showingAllTemperatureSensors {
+                VStack(alignment: .leading, spacing: 14) {
+                    ForEach(groups) { group in
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Label(group.name, systemImage: temperatureGroupIcon(group.name))
+                                    .font(.caption.weight(.semibold))
+                                Spacer()
+                                Text("\(group.sensors.count) 个")
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                            }
+
+                            LazyVGrid(
+                                columns: [GridItem(.adaptive(minimum: 170), spacing: 8)],
+                                spacing: 8
+                            ) {
+                                ForEach(group.sensors) { sensor in
+                                    temperatureSensorCell(sensor)
+                                }
+                            }
+                        }
+                    }
+                }
+                .transition(.opacity)
+            }
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 10).fill(.quaternary.opacity(0.4)))
+    }
+
+    private func temperatureGroupCard(_ group: TemperatureSensorGroup) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label(group.name, systemImage: temperatureGroupIcon(group.name))
+                    .font(.caption.weight(.semibold))
+                Spacer()
+                Text("\(group.sensors.count) 个")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("平均")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Text(String(format: "%.1f°C", group.average))
+                        .font(.system(.body, design: .rounded).weight(.semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(tempColor(group.average))
+                }
+                Spacer()
+                if let hottest = group.hottest {
+                    VStack(alignment: .trailing, spacing: 1) {
+                        Text("最高 · \(hottest.key)")
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                        Text(String(format: "%.1f°C", hottest.value))
+                            .font(.system(.body, design: .rounded).weight(.semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(tempColor(hottest.value))
+                    }
+                }
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(.background.opacity(0.55)))
+        .accessibilityElement(children: .combine)
+    }
+
+    private func temperatureSensorGroups(_ sensors: [TemperatureSensorReading]) -> [TemperatureSensorGroup] {
+        let order = ["CPU", "GPU", "内存", "电池", "机身", "SoC / 其他"]
+        let grouped = Dictionary(grouping: sensors, by: \.category)
+        return order.compactMap { name in
+            guard let groupSensors = grouped[name], !groupSensors.isEmpty else { return nil }
+            return TemperatureSensorGroup(name: name, sensors: groupSensors)
+        }
+    }
+
+    private func temperatureGroupIcon(_ name: String) -> String {
+        switch name {
+        case "CPU": return "cpu"
+        case "GPU": return "display"
+        case "内存": return "memorychip"
+        case "电池": return "battery.75percent"
+        case "机身": return "macbook"
+        default: return "square.stack.3d.up"
+        }
+    }
+
+    private func temperatureSensorCell(_ sensor: TemperatureSensorReading) -> some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(sensor.key)
+                    .font(.system(.subheadline, design: .monospaced).weight(.semibold))
+                Text(sensor.category)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: 6)
+
+            Text(String(format: "%.1f°C", sensor.value))
+                .font(.system(.body, design: .rounded).weight(.semibold))
+                .monospacedDigit()
+                .foregroundStyle(tempColor(sensor.value))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(RoundedRectangle(cornerRadius: 8).fill(.background.opacity(0.55)))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(sensor.category) 传感器 \(sensor.key)，\(String(format: "%.1f", sensor.value)) 摄氏度")
     }
 
     // MARK: - Detail section
