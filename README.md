@@ -27,7 +27,7 @@ macOS 菜单栏风扇控制与温度监控工具，面向 Apple Silicon（M1–M
 ### 方式一：源码编译
 
 ```bash
-git clone https://github.com/chansss/iFans.git
+git clone https://github.com/Zorabi/iFans.git
 cd iFans
 # Release 编译并安装到 /Applications
 bash build.sh
