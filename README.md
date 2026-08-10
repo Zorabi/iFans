@@ -101,6 +101,10 @@ A: Apple Silicon 设备可能暴露上百个温度 SMC 键。iFan 首次识别�
 
 本次改进重点包括 Apple Silicon 核心/热点传感器补全、全部温度传感器聚合、固定宽度菜单栏、监控性能优化以及 macOS App Icon 适配。
 
+## 参与贡献
+
+欢迎提交 Issue 和 Pull Request。开始之前请阅读 [贡献指南](CONTRIBUTING.md)，尤其注意 SMC 兼容性、风扇安全恢复和性能回归验证要求。
+
 ## License
 
 本 Fork 作为整体依据 [GNU Affero General Public License v3.0](LICENSE) 发布。任何通过网络向用户提供本软件功能的修改版本，也必须向这些用户提供对应源代码。
