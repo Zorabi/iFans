@@ -13,6 +13,7 @@ struct MainWindowView: View {
     @EnvironmentObject var state: AppState
     @State private var showingAdd = false
     @State private var showingLog = false
+    @State private var showingTemperatureSettings = false
     @State private var showingAllTemperatureSensors = false
     @State private var draggingPolicyID: UUID?
 
@@ -35,6 +36,14 @@ struct MainWindowView: View {
         }
         .sheet(isPresented: $showingLog) {
             LogSheet { state.helperLog() }
+        }
+        .sheet(isPresented: $showingTemperatureSettings) {
+            TemperatureSettingsSheet(
+                curves: state.temperatureCurves,
+                selectedID: state.selectedTemperatureCurveID
+            ) { curves, selectedID in
+                state.updateTemperatureCurves(curves, selectedID: selectedID)
+            }
         }
         .alert("提示", isPresented: Binding(
             get: { state.lastError != nil },
@@ -67,7 +76,17 @@ struct MainWindowView: View {
                         ProgressView().controlSize(.small)
                     }
                 }
-                if !state.currentPolicy.isSystem {
+                if state.currentPolicy.isTemperatureControlled {
+                    HStack(spacing: 6) {
+                        Text(temperatureControlSummary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("设置") { showingTemperatureSettings = true }
+                            .font(.caption)
+                            .buttonStyle(.borderless)
+                    }
+                } else if !state.currentPolicy.isSystem {
                     Text("左 \(Int(state.currentPolicy.leftPercent))%  ·  右 \(Int(state.currentPolicy.rightPercent))%")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -110,12 +129,15 @@ struct MainWindowView: View {
                             policy: policy,
                             isCurrent: policy.id == state.currentPolicyID,
                             helperInstalled: state.helperInstalled,
+                            temperatureCurveName: state.selectedTemperatureCurve?.name ?? "未选择曲线",
+                            temperatureLevelCount: state.temperatureLevels.count,
                             onSelect: { state.applyPolicy(policy) },
+                            onConfigure: { showingTemperatureSettings = true },
                             onDelete: { state.deletePolicy(policy) }
                         )
                         .opacity(draggingPolicyID == policy.id ? 0.4 : 1.0)
                         .onDrag {
-                            guard !policy.isSystem else { return NSItemProvider() }
+                            guard !policy.isBuiltIn else { return NSItemProvider() }
                             draggingPolicyID = policy.id
                             return NSItemProvider(object: policy.id.uuidString as NSString)
                         }
@@ -147,6 +169,17 @@ struct MainWindowView: View {
             }
             .padding(16)
         }
+    }
+
+    private var temperatureControlSummary: String {
+        let temperature = state.temperatureControlTemperature
+            .map { String(format: "%.1f°C", $0) } ?? "温度不可用"
+        let curveName = state.selectedTemperatureCurve?.name ?? "温控曲线"
+        guard let active = state.activeTemperatureLevel,
+              let index = state.temperatureLevels.firstIndex(where: { $0.id == active.id }) else {
+            return "\(curveName) · CPU 热点 \(temperature) · 系统自动"
+        }
+        return "\(curveName) · CPU 热点 \(temperature) · \(index + 1) 档 \(Int(active.percent))%"
     }
 
     // MARK: - Helper bar
@@ -657,10 +690,10 @@ private struct PolicyDropDelegate: DropDelegate {
     func dropEntered(info: DropInfo) {
         guard let draggingID,
               draggingID != policy.id,
-              !policy.isSystem,
+              !policy.isBuiltIn,
               let fromIdx = policies.firstIndex(where: { $0.id == draggingID }),
               let toIdx = policies.firstIndex(where: { $0.id == policy.id }),
-              fromIdx != 0, toIdx != 0 else { return }
+              !policies[fromIdx].isBuiltIn else { return }
 
         withAnimation(.easeInOut(duration: 0.2)) {
             let dest = toIdx > fromIdx ? toIdx + 1 : toIdx
@@ -669,7 +702,7 @@ private struct PolicyDropDelegate: DropDelegate {
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
-        policy.isSystem ? nil : DropProposal(operation: .move)
+        policy.isBuiltIn ? nil : DropProposal(operation: .move)
     }
 }
 
@@ -679,7 +712,10 @@ private struct PolicyRow: View {
     let policy: FanPolicy
     let isCurrent: Bool
     let helperInstalled: Bool
+    let temperatureCurveName: String
+    let temperatureLevelCount: Int
     let onSelect: () -> Void
+    let onConfigure: () -> Void
     let onDelete: () -> Void
     @State private var hovering = false
 
@@ -689,14 +725,24 @@ private struct PolicyRow: View {
                 .foregroundStyle(isCurrent ? Color.accentColor : .secondary)
             VStack(alignment: .leading, spacing: 2) {
                 Text(policy.name).fontWeight(isCurrent ? .semibold : .regular)
-                if !policy.isSystem {
+                if policy.isTemperatureControlled {
+                    Text("\(temperatureCurveName) · \(temperatureLevelCount) 档")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else if !policy.isSystem {
                     Text("左 \(Int(policy.leftPercent))%  ·  右 \(Int(policy.rightPercent))%")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
             }
             Spacer()
-            if !policy.isSystem && hovering {
+            if policy.isTemperatureControlled && hovering {
+                Button(action: onConfigure) {
+                    Image(systemName: "slider.horizontal.3")
+                }
+                .buttonStyle(.borderless)
+                .help("设置温控档位")
+            } else if !policy.isBuiltIn && hovering {
                 Button(role: .destructive, action: onDelete) {
                     Image(systemName: "trash")
                 }
@@ -714,10 +760,244 @@ private struct PolicyRow: View {
         }
         .onHover { hovering = $0 }
         .contextMenu {
-            if !policy.isSystem {
+            if policy.isTemperatureControlled {
+                Button(action: onConfigure) { Label("设置温控曲线", systemImage: "slider.horizontal.3") }
+            } else if !policy.isBuiltIn {
                 Button(role: .destructive, action: onDelete) { Label("删除", systemImage: "trash") }
             }
         }
+    }
+}
+
+// MARK: - Temperature control settings
+
+private struct TemperatureSettingsSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var curves: [TemperatureFanCurve]
+    @State private var selectedID: UUID
+    let onSave: ([TemperatureFanCurve], UUID) -> Void
+
+    init(
+        curves: [TemperatureFanCurve],
+        selectedID: UUID,
+        onSave: @escaping ([TemperatureFanCurve], UUID) -> Void
+    ) {
+        _curves = State(initialValue: curves)
+        _selectedID = State(initialValue: selectedID)
+        self.onSave = onSave
+    }
+
+    private var selectedIndex: Int? {
+        curves.firstIndex { $0.id == selectedID }
+    }
+
+    private var hasDuplicateThresholds: Bool {
+        curves.contains { curve in
+            Set(curve.levels.map { Int($0.threshold.rounded()) }).count != curve.levels.count
+        }
+    }
+
+    private var hasEmptyCurve: Bool {
+        curves.contains { $0.levels.isEmpty }
+    }
+
+    private var hasInvalidNames: Bool {
+        let names = curves.map { $0.name.trimmingCharacters(in: .whitespacesAndNewlines) }
+        return names.contains(where: \.isEmpty)
+            || Set(names.map { $0.lowercased() }).count != names.count
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("智能温控设置")
+                    .font(.title2.weight(.semibold))
+                Text("保存多套自定义曲线，并选择当前用于自动调速的一套。")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 10) {
+                Picker("当前曲线", selection: $selectedID) {
+                    ForEach(curves) { curve in
+                        Text(curve.name).tag(curve.id)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+
+                Button(action: addCurve) {
+                    Image(systemName: "plus")
+                }
+                .help("新建曲线")
+
+                Button(action: duplicateCurve) {
+                    Image(systemName: "plus.square.on.square")
+                }
+                .help("复制当前曲线")
+
+                Button(role: .destructive, action: deleteSelectedCurve) {
+                    Image(systemName: "trash")
+                }
+                .help("删除当前曲线")
+                .disabled(curves.count == 1)
+            }
+
+            if let curveIndex = selectedIndex {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("曲线名称")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    TextField("例如：游戏散热", text: $curves[curveIndex].name)
+                        .textFieldStyle(.roundedBorder)
+                }
+
+                ScrollView {
+                    VStack(spacing: 10) {
+                        ForEach(Array(curves[curveIndex].levels.indices), id: \.self) { levelIndex in
+                            levelRow(curveIndex: curveIndex, levelIndex: levelIndex)
+                        }
+                    }
+                }
+                .frame(maxHeight: 330)
+
+                HStack {
+                    Button {
+                        addLevel(to: curveIndex)
+                    } label: {
+                        Label("添加档位", systemImage: "plus")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.regular)
+                    .disabled(curves[curveIndex].levels.count >= 10)
+
+                    Button {
+                        curves[curveIndex].levels = TemperatureFanLevel.defaults
+                    } label: {
+                        Label("恢复默认档位", systemImage: "arrow.counterclockwise")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.regular)
+
+                    Spacer()
+                }
+                .padding(.vertical, 2)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                if hasDuplicateThresholds {
+                    Label("每个档位需要使用不同的温度阈值", systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                }
+                if hasInvalidNames {
+                    Label("曲线名称不能为空或重复", systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                }
+                Text("降温时会比当前阈值低 3°C 后再降档，避免频繁切换。低于首档或温度不可用时，自动恢复系统控制。")
+                    .foregroundStyle(.secondary)
+            }
+            .font(.caption)
+
+            HStack {
+                Spacer()
+                Button("取消") { dismiss() }
+                Button("保存") {
+                    onSave(curves, selectedID)
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(hasEmptyCurve || hasDuplicateThresholds || hasInvalidNames)
+            }
+        }
+        .padding(20)
+        .frame(width: 560)
+    }
+
+    private func levelRow(curveIndex: Int, levelIndex: Int) -> some View {
+        let level = $curves[curveIndex].levels[levelIndex]
+        return VStack(spacing: 10) {
+            HStack {
+                Text("\(levelIndex + 1) 档")
+                    .font(.headline)
+                    .frame(width: 42, alignment: .leading)
+
+                Stepper(value: level.threshold, in: 40...100, step: 1) {
+                    Text("达到 \(Int(level.wrappedValue.threshold))°C")
+                        .monospacedDigit()
+                }
+
+                Spacer()
+
+                Button(role: .destructive) {
+                    curves[curveIndex].levels.remove(at: levelIndex)
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.borderless)
+                .disabled(curves[curveIndex].levels.count == 1)
+            }
+
+            HStack(spacing: 10) {
+                Text("风扇")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 42, alignment: .leading)
+                Slider(value: level.percent, in: 0...100, step: 1)
+                Text("\(Int(level.wrappedValue.percent))%")
+                    .monospacedDigit()
+                    .frame(width: 42, alignment: .trailing)
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 10).fill(.quaternary.opacity(0.45)))
+    }
+
+    private func addCurve() {
+        let levels = TemperatureFanLevel.defaults.map {
+            TemperatureFanLevel(threshold: $0.threshold, percent: $0.percent)
+        }
+        let curve = TemperatureFanCurve(name: uniqueName("新温控曲线"), levels: levels)
+        curves.append(curve)
+        selectedID = curve.id
+    }
+
+    private func duplicateCurve() {
+        guard let index = selectedIndex else { return }
+        let source = curves[index]
+        let levels = source.levels.map {
+            TemperatureFanLevel(threshold: $0.threshold, percent: $0.percent)
+        }
+        let copy = TemperatureFanCurve(name: uniqueName("\(source.name) 副本"), levels: levels)
+        curves.append(copy)
+        selectedID = copy.id
+    }
+
+    private func deleteSelectedCurve() {
+        guard curves.count > 1, let index = selectedIndex else { return }
+        curves.remove(at: index)
+        selectedID = curves[min(index, curves.count - 1)].id
+    }
+
+    private func addLevel(to curveIndex: Int) {
+        let levels = curves[curveIndex].levels
+        let occupied = Set(levels.map { Int($0.threshold.rounded()) })
+        let preferred = min(100, Int((levels.map(\.threshold).max() ?? 50) + 5))
+        let threshold = (preferred...100).first { !occupied.contains($0) }
+            ?? (40...100).first { !occupied.contains($0) }
+            ?? preferred
+        let percent = min(100, (levels.last?.percent ?? 20) + 10)
+        curves[curveIndex].levels.append(
+            TemperatureFanLevel(threshold: Double(threshold), percent: percent)
+        )
+    }
+
+    private func uniqueName(_ base: String) -> String {
+        let existing = Set(curves.map { $0.name.lowercased() })
+        if !existing.contains(base.lowercased()) { return base }
+        for suffix in 2...99 {
+            let candidate = "\(base) \(suffix)"
+            if !existing.contains(candidate.lowercased()) { return candidate }
+        }
+        return "\(base) \(UUID().uuidString.prefix(4))"
     }
 }
 

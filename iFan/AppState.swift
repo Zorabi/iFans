@@ -8,6 +8,9 @@ final class AppState: ObservableObject {
     @Published var snapshot = SensorSnapshot()
     @Published var policies: [FanPolicy] = []
     @Published var currentPolicyID: UUID = FanPolicy.system.id
+    @Published var temperatureCurves: [TemperatureFanCurve] = TemperatureFanCurve.defaults
+    @Published var selectedTemperatureCurveID: UUID = TemperatureFanCurve.balancedID
+    @Published private(set) var activeTemperatureLevel: TemperatureFanLevel?
     @Published var helperInstalled = false
     @Published var isInstalling = false
     @Published var lastError: String?
@@ -19,13 +22,34 @@ final class AppState: ObservableObject {
 
     private let policiesKey = "ifan.policies.v1"
     private let currentKey = "ifan.currentPolicy.v1"
+    private let temperatureCurvesKey = "ifan.temperatureCurves.v2"
+    private let selectedTemperatureCurveKey = "ifan.selectedTemperatureCurve.v2"
+    /// Legacy single-curve storage, read once during migration.
+    private let temperatureLevelsKey = "ifan.temperatureLevels.v1"
+
+    /// Prevents rapid up/down switching when temperature hovers around a threshold.
+    let temperatureHysteresis: Double = 3
 
     var currentPolicy: FanPolicy {
         policies.first { $0.id == currentPolicyID } ?? FanPolicy.system
     }
 
+    var temperatureControlTemperature: Double? {
+        snapshot.cpuMaxTemp ?? snapshot.cpuTemp
+    }
+
+    var selectedTemperatureCurve: TemperatureFanCurve? {
+        temperatureCurves.first { $0.id == selectedTemperatureCurveID }
+            ?? temperatureCurves.first
+    }
+
+    var temperatureLevels: [TemperatureFanLevel] {
+        selectedTemperatureCurve?.levels ?? []
+    }
+
     init() {
         loadPolicies()
+        loadTemperatureCurves()
         helperInstalled = FanController.isInstalled
         refresh()
         startMonitoring()
@@ -49,6 +73,7 @@ final class AppState: ObservableObject {
         if let snap = reader?.read(cachedTemperatureSensors: snapshot.temperatureSensors) {
             snapshot = snap
         }
+        updateTemperatureControl()
         // Keep the daemon's watchdog fed while a manual policy is active.
         if helperInstalled && !currentPolicy.isSystem {
             FanController.touchHeartbeat()
@@ -66,7 +91,7 @@ final class AppState: ObservableObject {
     }
 
     func deletePolicy(_ policy: FanPolicy) {
-        guard !policy.isSystem else { return }
+        guard !policy.isBuiltIn else { return }
         policies.removeAll { $0.id == policy.id }
         if currentPolicyID == policy.id {
             currentPolicyID = FanPolicy.system.id
@@ -78,15 +103,28 @@ final class AppState: ObservableObject {
 
     func applyPolicy(_ policy: FanPolicy) {
         currentPolicyID = policy.id
+        if !policy.isTemperatureControlled {
+            activeTemperatureLevel = nil
+        }
         UserDefaults.standard.set(policy.id.uuidString, forKey: currentKey)
         pushCurrentToDaemon()
     }
 
+    func updateTemperatureCurves(_ curves: [TemperatureFanCurve], selectedID: UUID) {
+        guard !curves.isEmpty else { return }
+        temperatureCurves = curves.map(normalizedCurve)
+        selectedTemperatureCurveID = temperatureCurves.contains { $0.id == selectedID }
+            ? selectedID
+            : temperatureCurves[0].id
+        saveTemperatureCurves()
+        updateTemperatureControl(force: true)
+    }
+
     func movePolicies(from source: IndexSet, to destination: Int) {
-        // System policy stays locked at index 0.
+        // Built-in policies stay locked at the start of the list.
         var dest = destination
-        if dest == 0 { dest = 1 }
-        guard !source.contains(0) else { return }
+        if dest < 2 { dest = 2 }
+        guard source.allSatisfy({ !policies[$0].isBuiltIn }) else { return }
         policies.move(fromOffsets: source, toOffset: dest)
         savePolicies()
     }
@@ -97,10 +135,59 @@ final class AppState: ObservableObject {
         let p = currentPolicy
         if p.isSystem {
             FanController.sendCommand(manual: false, left: 0, right: 0)
+        } else if p.isTemperatureControlled {
+            updateTemperatureControl(force: true)
         } else {
             let l = rpm(min: snapshot.fan0Min, max: snapshot.fan0Max, percent: p.leftPercent)
             let r = rpm(min: snapshot.fan1Min, max: snapshot.fan1Max, percent: p.rightPercent)
             FanController.sendCommand(manual: true, left: l, right: r)
+        }
+    }
+
+    /// Selects the hottest matching level. Rising temperature takes effect
+    /// immediately; falling temperature must clear the current threshold by the
+    /// hysteresis amount before a lower level is selected.
+    private func updateTemperatureControl(force: Bool = false) {
+        guard currentPolicy.isTemperatureControlled else { return }
+
+        guard let temperature = temperatureControlTemperature else {
+            let changed = activeTemperatureLevel != nil
+            activeTemperatureLevel = nil
+            if helperInstalled && (changed || force) {
+                FanController.sendCommand(manual: false, left: 0, right: 0)
+            }
+            return
+        }
+
+        let matchingLevel = temperatureLevels.last { temperature >= $0.threshold }
+        let nextLevel: TemperatureFanLevel?
+        if !force,
+           let current = activeTemperatureLevel,
+           temperature >= current.threshold - temperatureHysteresis,
+           (matchingLevel?.threshold ?? -.infinity) <= current.threshold {
+            nextLevel = current
+        } else {
+            nextLevel = matchingLevel
+        }
+
+        let changed = nextLevel != activeTemperatureLevel
+        activeTemperatureLevel = nextLevel
+        guard helperInstalled && (changed || force) else { return }
+
+        if let level = nextLevel {
+            let left = rpm(
+                min: snapshot.fan0Min,
+                max: snapshot.fan0Max,
+                percent: level.percent
+            )
+            let right = rpm(
+                min: snapshot.fan1Min,
+                max: snapshot.fan1Max,
+                percent: level.percent
+            )
+            FanController.sendCommand(manual: true, left: left, right: right)
+        } else {
+            FanController.sendCommand(manual: false, left: 0, right: 0)
         }
     }
 
@@ -152,9 +239,8 @@ final class AppState: ObservableObject {
         if let data = defaults.data(forKey: policiesKey),
            let decoded = try? JSONDecoder().decode([FanPolicy].self, from: data),
            !decoded.isEmpty {
-            var list = decoded.filter { !$0.isSystem }
-            list.insert(.system, at: 0)
-            policies = list
+            let customPolicies = decoded.filter { !$0.isBuiltIn }
+            policies = [.system, .temperature] + customPolicies
         } else {
             policies = FanPolicy.defaults
         }
@@ -169,6 +255,64 @@ final class AppState: ObservableObject {
         if let data = try? JSONEncoder().encode(policies) {
             UserDefaults.standard.set(data, forKey: policiesKey)
         }
+    }
+
+    private func loadTemperatureCurves() {
+        let defaults = UserDefaults.standard
+        if let data = defaults.data(forKey: temperatureCurvesKey),
+           let decoded = try? JSONDecoder().decode([TemperatureFanCurve].self, from: data),
+           !decoded.isEmpty {
+            temperatureCurves = decoded.map(normalizedCurve)
+            if let idString = defaults.string(forKey: selectedTemperatureCurveKey),
+               let id = UUID(uuidString: idString),
+               temperatureCurves.contains(where: { $0.id == id }) {
+                selectedTemperatureCurveID = id
+            } else {
+                selectedTemperatureCurveID = temperatureCurves[0].id
+            }
+            return
+        }
+
+        // Migrate the single editable curve created by the previous version.
+        if let data = defaults.data(forKey: temperatureLevelsKey),
+           let legacyLevels = try? JSONDecoder().decode([TemperatureFanLevel].self, from: data),
+           !legacyLevels.isEmpty {
+            let migrated = normalizedCurve(
+                TemperatureFanCurve(name: "我的温控", levels: legacyLevels)
+            )
+            temperatureCurves = [migrated]
+            selectedTemperatureCurveID = migrated.id
+            saveTemperatureCurves()
+            return
+        }
+
+        temperatureCurves = TemperatureFanCurve.defaults
+        selectedTemperatureCurveID = TemperatureFanCurve.balancedID
+    }
+
+    private func saveTemperatureCurves() {
+        if let data = try? JSONEncoder().encode(temperatureCurves) {
+            UserDefaults.standard.set(data, forKey: temperatureCurvesKey)
+        }
+        UserDefaults.standard.set(
+            selectedTemperatureCurveID.uuidString,
+            forKey: selectedTemperatureCurveKey
+        )
+    }
+
+    private func normalizedCurve(_ curve: TemperatureFanCurve) -> TemperatureFanCurve {
+        var normalized = curve
+        normalized.name = curve.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        normalized.levels = curve.levels
+            .map {
+                TemperatureFanLevel(
+                    id: $0.id,
+                    threshold: min(100, max(40, $0.threshold)),
+                    percent: min(100, max(0, $0.percent))
+                )
+            }
+            .sorted { $0.threshold < $1.threshold }
+        return normalized
     }
 }
 

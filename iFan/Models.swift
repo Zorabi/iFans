@@ -10,6 +10,11 @@ struct FanPolicy: Identifiable, Codable, Equatable {
     var rightPercent: Double
     /// System auto policy: hands control back to macOS (cannot be deleted).
     var isSystem: Bool = false
+    /// Kept optional so policies saved by older iFan versions still decode.
+    var temperatureControlled: Bool? = nil
+
+    var isTemperatureControlled: Bool { temperatureControlled == true }
+    var isBuiltIn: Bool { isSystem || isTemperatureControlled }
 
     static let system = FanPolicy(
         id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
@@ -19,11 +24,73 @@ struct FanPolicy: Identifiable, Codable, Equatable {
         isSystem: true
     )
 
+    static let temperature = FanPolicy(
+        id: UUID(uuidString: "00000000-0000-0000-0000-000000000002")!,
+        name: "智能温控",
+        leftPercent: 0,
+        rightPercent: 0,
+        temperatureControlled: true
+    )
+
     static let defaults: [FanPolicy] = [
         system,
+        temperature,
         FanPolicy(name: "安静", leftPercent: 20, rightPercent: 20),
         FanPolicy(name: "均衡", leftPercent: 50, rightPercent: 50),
         FanPolicy(name: "全速", leftPercent: 100, rightPercent: 100),
+    ]
+}
+
+/// One step in the CPU-hotspot driven fan curve.
+struct TemperatureFanLevel: Identifiable, Codable, Equatable {
+    var id: UUID = UUID()
+    var threshold: Double
+    var percent: Double
+
+    static let defaults: [TemperatureFanLevel] = [
+        TemperatureFanLevel(threshold: 55, percent: 30),
+        TemperatureFanLevel(threshold: 65, percent: 45),
+        TemperatureFanLevel(threshold: 75, percent: 65),
+        TemperatureFanLevel(threshold: 85, percent: 85),
+        TemperatureFanLevel(threshold: 90, percent: 100),
+    ]
+}
+
+/// A named, user-editable temperature-to-fan-speed curve.
+struct TemperatureFanCurve: Identifiable, Codable, Equatable {
+    var id: UUID = UUID()
+    var name: String
+    var levels: [TemperatureFanLevel]
+
+    static let balancedID = UUID(uuidString: "00000000-0000-0000-0000-000000000102")!
+
+    static let defaults: [TemperatureFanCurve] = [
+        TemperatureFanCurve(
+            id: UUID(uuidString: "00000000-0000-0000-0000-000000000101")!,
+            name: "安静温控",
+            levels: [
+                TemperatureFanLevel(threshold: 60, percent: 25),
+                TemperatureFanLevel(threshold: 70, percent: 40),
+                TemperatureFanLevel(threshold: 80, percent: 60),
+                TemperatureFanLevel(threshold: 90, percent: 85),
+                TemperatureFanLevel(threshold: 95, percent: 100),
+            ]
+        ),
+        TemperatureFanCurve(
+            id: balancedID,
+            name: "均衡温控",
+            levels: TemperatureFanLevel.defaults
+        ),
+        TemperatureFanCurve(
+            id: UUID(uuidString: "00000000-0000-0000-0000-000000000103")!,
+            name: "强力散热",
+            levels: [
+                TemperatureFanLevel(threshold: 50, percent: 35),
+                TemperatureFanLevel(threshold: 60, percent: 55),
+                TemperatureFanLevel(threshold: 70, percent: 75),
+                TemperatureFanLevel(threshold: 80, percent: 100),
+            ]
+        ),
     ]
 }
 
