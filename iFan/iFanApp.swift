@@ -135,6 +135,14 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
 
         for policy in state.policies {
             let item = NSMenuItem(title: policy.name, action: #selector(applyPolicy(_:)), keyEquivalent: "")
+            if policy.isTemperatureControlled,
+               let curveName = state.selectedTemperatureCurve?.name {
+                if #available(macOS 14.4, *) {
+                    item.subtitle = curveName
+                } else {
+                    item.title = "\(policy.name) · \(curveName)"
+                }
+            }
             item.target = self
             item.representedObject = policy.id.uuidString
             item.state = policy.id == state.currentPolicyID ? .on : .off
