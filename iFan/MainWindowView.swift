@@ -172,14 +172,16 @@ struct MainWindowView: View {
     }
 
     private var temperatureControlSummary: String {
-        let temperature = state.temperatureControlTemperature
+        let hotspot = state.temperatureControlTemperature
             .map { String(format: "%.1f°C", $0) } ?? "温度不可用"
+        let controlTemperature = state.smoothedTemperatureControlTemperature
+            .map { String(format: "%.1f°C", $0) } ?? "--"
         let curveName = state.selectedTemperatureCurve?.name ?? "温控曲线"
         guard let active = state.activeTemperatureLevel,
               let index = state.temperatureLevels.firstIndex(where: { $0.id == active.id }) else {
-            return "\(curveName) · CPU 热点 \(temperature) · 系统自动"
+            return "\(curveName) · 热点 \(hotspot) / 控制 \(controlTemperature) · 系统自动"
         }
-        return "\(curveName) · CPU 热点 \(temperature) · \(index + 1) 档 \(Int(active.percent))%"
+        return "\(curveName) · 热点 \(hotspot) / 控制 \(controlTemperature) · \(index + 1) 档 \(Int(active.percent))%"
     }
 
     // MARK: - Helper bar
@@ -871,7 +873,9 @@ private struct TemperatureSettingsSheet: View {
                     .disabled(curves[curveIndex].levels.count >= 10)
 
                     Button {
-                        curves[curveIndex].levels = TemperatureFanLevel.defaults
+                        curves[curveIndex].levels = TemperatureFanCurve.defaultLevels(
+                            for: curves[curveIndex].id
+                        ) ?? TemperatureFanLevel.defaults
                     } label: {
                         Label("恢复默认档位", systemImage: "arrow.counterclockwise")
                     }
@@ -892,7 +896,7 @@ private struct TemperatureSettingsSheet: View {
                     Label("曲线名称不能为空或重复", systemImage: "exclamationmark.triangle.fill")
                         .foregroundStyle(.orange)
                 }
-                Text("降温时会比当前阈值低 3°C 后再降档，避免频繁切换。低于首档或温度不可用时，自动恢复系统控制。")
+                Text("控制温度取最近 10 秒 CPU 热点平均值；升档需持续 4 秒，达到最高档阈值时立即生效；降档需低于当前阈值 4°C 并持续 20 秒。低于首档或温度不可用时，自动恢复系统控制。")
                     .foregroundStyle(.secondary)
             }
             .font(.caption)

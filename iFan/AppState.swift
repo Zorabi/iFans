@@ -11,6 +11,7 @@ final class AppState: ObservableObject {
     @Published var temperatureCurves: [TemperatureFanCurve] = TemperatureFanCurve.defaults
     @Published var selectedTemperatureCurveID: UUID = TemperatureFanCurve.balancedID
     @Published private(set) var activeTemperatureLevel: TemperatureFanLevel?
+    @Published private(set) var smoothedTemperatureControlTemperature: Double?
     @Published var helperInstalled = false
     @Published var isInstalling = false
     @Published var lastError: String?
@@ -24,11 +25,20 @@ final class AppState: ObservableObject {
     private let currentKey = "ifan.currentPolicy.v1"
     private let temperatureCurvesKey = "ifan.temperatureCurves.v2"
     private let selectedTemperatureCurveKey = "ifan.selectedTemperatureCurve.v2"
+    private let temperatureCurveDefaultsVersionKey = "ifan.temperatureCurveDefaultsVersion"
+    private let temperatureCurveDefaultsVersion = 2
     /// Legacy single-curve storage, read once during migration.
     private let temperatureLevelsKey = "ifan.temperatureLevels.v1"
 
-    /// Prevents rapid up/down switching when temperature hovers around a threshold.
-    let temperatureHysteresis: Double = 3
+    let temperatureAveragingWindow: TimeInterval = 10
+    let temperatureRiseDelay: TimeInterval = 4
+    let temperatureFallDelay: TimeInterval = 20
+    /// A lower level is considered only after clearing the current threshold.
+    let temperatureHysteresis: Double = 4
+
+    private var temperatureSamples: [(date: Date, value: Double)] = []
+    private var pendingTemperatureLevel: TemperatureFanLevel?
+    private var pendingTemperatureChangeStartedAt: Date?
 
     var currentPolicy: FanPolicy {
         policies.first { $0.id == currentPolicyID } ?? FanPolicy.system
@@ -73,7 +83,9 @@ final class AppState: ObservableObject {
         if let snap = reader?.read(cachedTemperatureSensors: snapshot.temperatureSensors) {
             snapshot = snap
         }
-        updateTemperatureControl()
+        let now = Date()
+        updateSmoothedTemperature(now: now)
+        updateTemperatureControl(now: now)
         // Keep the daemon's watchdog fed while a manual policy is active.
         if helperInstalled && !currentPolicy.isSystem {
             FanController.touchHeartbeat()
@@ -106,6 +118,7 @@ final class AppState: ObservableObject {
         if !policy.isTemperatureControlled {
             activeTemperatureLevel = nil
         }
+        clearPendingTemperatureChange()
         UserDefaults.standard.set(policy.id.uuidString, forKey: currentKey)
         pushCurrentToDaemon()
     }
@@ -116,6 +129,8 @@ final class AppState: ObservableObject {
         selectedTemperatureCurveID = temperatureCurves.contains { $0.id == selectedID }
             ? selectedID
             : temperatureCurves[0].id
+        activeTemperatureLevel = nil
+        clearPendingTemperatureChange()
         saveTemperatureCurves()
         updateTemperatureControl(force: true)
     }
@@ -144,15 +159,17 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// Selects the hottest matching level. Rising temperature takes effect
-    /// immediately; falling temperature must clear the current threshold by the
-    /// hysteresis amount before a lower level is selected.
-    private func updateTemperatureControl(force: Bool = false) {
+    /// Uses a moving average for normal transitions. A rise must persist briefly;
+    /// a fall must clear hysteresis and persist longer. The highest configured
+    /// threshold always takes effect immediately.
+    private func updateTemperatureControl(force: Bool = false, now: Date = Date()) {
         guard currentPolicy.isTemperatureControlled else { return }
 
-        guard let temperature = temperatureControlTemperature else {
+        guard let temperature = smoothedTemperatureControlTemperature
+                ?? temperatureControlTemperature else {
             let changed = activeTemperatureLevel != nil
             activeTemperatureLevel = nil
+            clearPendingTemperatureChange()
             if helperInstalled && (changed || force) {
                 FanController.sendCommand(manual: false, left: 0, right: 0)
             }
@@ -160,18 +177,84 @@ final class AppState: ObservableObject {
         }
 
         let matchingLevel = temperatureLevels.last { temperature >= $0.threshold }
-        let nextLevel: TemperatureFanLevel?
+        var desiredLevel = matchingLevel
+
         if !force,
-           let current = activeTemperatureLevel,
-           temperature >= current.threshold - temperatureHysteresis,
-           (matchingLevel?.threshold ?? -.infinity) <= current.threshold {
-            nextLevel = current
-        } else {
-            nextLevel = matchingLevel
+           let highestLevel = temperatureLevels.last,
+           let rawTemperature = temperatureControlTemperature,
+           rawTemperature >= highestLevel.threshold {
+            commitTemperatureLevel(highestLevel)
+            return
         }
 
+        if let current = activeTemperatureLevel,
+           levelRank(matchingLevel) < levelRank(current),
+           temperature >= current.threshold - temperatureHysteresis {
+            desiredLevel = current
+        }
+
+        if force {
+            commitTemperatureLevel(desiredLevel, force: true)
+            return
+        }
+
+        guard desiredLevel != activeTemperatureLevel else {
+            clearPendingTemperatureChange()
+            return
+        }
+
+        let isHighestLevel = desiredLevel?.id == temperatureLevels.last?.id
+        if isHighestLevel {
+            commitTemperatureLevel(desiredLevel)
+            return
+        }
+
+        if pendingTemperatureChangeStartedAt == nil
+            || pendingTemperatureLevel != desiredLevel {
+            pendingTemperatureLevel = desiredLevel
+            pendingTemperatureChangeStartedAt = now
+            return
+        }
+
+        let isRising = levelRank(desiredLevel) > levelRank(activeTemperatureLevel)
+        let delay = isRising ? temperatureRiseDelay : temperatureFallDelay
+        guard let startedAt = pendingTemperatureChangeStartedAt,
+              now.timeIntervalSince(startedAt) >= delay else { return }
+
+        commitTemperatureLevel(desiredLevel)
+    }
+
+    private func updateSmoothedTemperature(now: Date) {
+        guard let temperature = temperatureControlTemperature else {
+            temperatureSamples.removeAll()
+            smoothedTemperatureControlTemperature = nil
+            return
+        }
+
+        temperatureSamples.append((now, temperature))
+        let cutoff = now.addingTimeInterval(-temperatureAveragingWindow)
+        temperatureSamples.removeAll { $0.date < cutoff }
+        smoothedTemperatureControlTemperature = temperatureSamples
+            .map(\.value)
+            .reduce(0, +) / Double(temperatureSamples.count)
+    }
+
+    private func levelRank(_ level: TemperatureFanLevel?) -> Int {
+        guard let level else { return -1 }
+        return temperatureLevels.firstIndex { $0.id == level.id }
+            ?? temperatureLevels.lastIndex { $0.threshold <= level.threshold }
+            ?? -1
+    }
+
+    private func clearPendingTemperatureChange() {
+        pendingTemperatureLevel = nil
+        pendingTemperatureChangeStartedAt = nil
+    }
+
+    private func commitTemperatureLevel(_ nextLevel: TemperatureFanLevel?, force: Bool = false) {
         let changed = nextLevel != activeTemperatureLevel
         activeTemperatureLevel = nextLevel
+        clearPendingTemperatureChange()
         guard helperInstalled && (changed || force) else { return }
 
         if let level = nextLevel {
@@ -263,12 +346,25 @@ final class AppState: ObservableObject {
            let decoded = try? JSONDecoder().decode([TemperatureFanCurve].self, from: data),
            !decoded.isEmpty {
             temperatureCurves = decoded.map(normalizedCurve)
+            let needsDefaultMigration = defaults.integer(
+                forKey: temperatureCurveDefaultsVersionKey
+            ) < temperatureCurveDefaultsVersion
+            if needsDefaultMigration {
+                temperatureCurves = temperatureCurves.map(migratingLegacyDefaultCurve)
+                defaults.set(
+                    temperatureCurveDefaultsVersion,
+                    forKey: temperatureCurveDefaultsVersionKey
+                )
+            }
             if let idString = defaults.string(forKey: selectedTemperatureCurveKey),
                let id = UUID(uuidString: idString),
                temperatureCurves.contains(where: { $0.id == id }) {
                 selectedTemperatureCurveID = id
             } else {
                 selectedTemperatureCurveID = temperatureCurves[0].id
+            }
+            if needsDefaultMigration {
+                saveTemperatureCurves()
             }
             return
         }
@@ -282,12 +378,20 @@ final class AppState: ObservableObject {
             )
             temperatureCurves = [migrated]
             selectedTemperatureCurveID = migrated.id
+            defaults.set(
+                temperatureCurveDefaultsVersion,
+                forKey: temperatureCurveDefaultsVersionKey
+            )
             saveTemperatureCurves()
             return
         }
 
         temperatureCurves = TemperatureFanCurve.defaults
         selectedTemperatureCurveID = TemperatureFanCurve.balancedID
+        defaults.set(
+            temperatureCurveDefaultsVersion,
+            forKey: temperatureCurveDefaultsVersionKey
+        )
     }
 
     private func saveTemperatureCurves() {
@@ -313,6 +417,29 @@ final class AppState: ObservableObject {
             }
             .sorted { $0.threshold < $1.threshold }
         return normalized
+    }
+
+    private func migratingLegacyDefaultCurve(
+        _ curve: TemperatureFanCurve
+    ) -> TemperatureFanCurve {
+        guard let legacyLevels = TemperatureFanCurve.legacyDefaultLevels(for: curve.id),
+              levelsMatch(curve.levels, legacyLevels),
+              let newLevels = TemperatureFanCurve.defaultLevels(for: curve.id) else {
+            return curve
+        }
+
+        var migrated = curve
+        migrated.levels = newLevels
+        return normalizedCurve(migrated)
+    }
+
+    private func levelsMatch(
+        _ lhs: [TemperatureFanLevel],
+        _ rhs: [TemperatureFanLevel]
+    ) -> Bool {
+        lhs.count == rhs.count && zip(lhs, rhs).allSatisfy { pair in
+            pair.0.threshold == pair.1.threshold && pair.0.percent == pair.1.percent
+        }
     }
 }
 

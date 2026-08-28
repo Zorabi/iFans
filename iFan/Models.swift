@@ -47,13 +47,16 @@ struct TemperatureFanLevel: Identifiable, Codable, Equatable {
     var threshold: Double
     var percent: Double
 
-    static let defaults: [TemperatureFanLevel] = [
-        TemperatureFanLevel(threshold: 55, percent: 30),
-        TemperatureFanLevel(threshold: 65, percent: 45),
-        TemperatureFanLevel(threshold: 75, percent: 65),
-        TemperatureFanLevel(threshold: 85, percent: 85),
-        TemperatureFanLevel(threshold: 90, percent: 100),
-    ]
+    /// Balanced levels are also used as the starting point for a custom curve.
+    static var defaults: [TemperatureFanLevel] {
+        [
+            TemperatureFanLevel(threshold: 55, percent: 25),
+            TemperatureFanLevel(threshold: 65, percent: 40),
+            TemperatureFanLevel(threshold: 75, percent: 60),
+            TemperatureFanLevel(threshold: 85, percent: 80),
+            TemperatureFanLevel(threshold: 92, percent: 100),
+        ]
+    }
 }
 
 /// A named, user-editable temperature-to-fan-speed curve.
@@ -62,34 +65,82 @@ struct TemperatureFanCurve: Identifiable, Codable, Equatable {
     var name: String
     var levels: [TemperatureFanLevel]
 
+    static let quietID = UUID(uuidString: "00000000-0000-0000-0000-000000000101")!
     static let balancedID = UUID(uuidString: "00000000-0000-0000-0000-000000000102")!
+    static let strongID = UUID(uuidString: "00000000-0000-0000-0000-000000000103")!
 
-    static let defaults: [TemperatureFanCurve] = [
-        TemperatureFanCurve(
-            id: UUID(uuidString: "00000000-0000-0000-0000-000000000101")!,
-            name: "安静温控",
-            levels: [
+    static func defaultLevels(for curveID: UUID) -> [TemperatureFanLevel]? {
+        if curveID == quietID {
+            return [
+                TemperatureFanLevel(threshold: 65, percent: 25),
+                TemperatureFanLevel(threshold: 75, percent: 35),
+                TemperatureFanLevel(threshold: 85, percent: 50),
+                TemperatureFanLevel(threshold: 90, percent: 70),
+                TemperatureFanLevel(threshold: 95, percent: 100),
+            ]
+        }
+        if curveID == balancedID {
+            return TemperatureFanLevel.defaults
+        }
+        if curveID == strongID {
+            return [
+                TemperatureFanLevel(threshold: 50, percent: 35),
+                TemperatureFanLevel(threshold: 60, percent: 50),
+                TemperatureFanLevel(threshold: 70, percent: 70),
+                TemperatureFanLevel(threshold: 80, percent: 85),
+                TemperatureFanLevel(threshold: 88, percent: 100),
+            ]
+        }
+        return nil
+    }
+
+    /// Defaults shipped before the response-oriented curve update. Used only to
+    /// migrate untouched built-in curves without overwriting user edits.
+    static func legacyDefaultLevels(for curveID: UUID) -> [TemperatureFanLevel]? {
+        if curveID == quietID {
+            return [
                 TemperatureFanLevel(threshold: 60, percent: 25),
                 TemperatureFanLevel(threshold: 70, percent: 40),
                 TemperatureFanLevel(threshold: 80, percent: 60),
                 TemperatureFanLevel(threshold: 90, percent: 85),
                 TemperatureFanLevel(threshold: 95, percent: 100),
             ]
-        ),
-        TemperatureFanCurve(
-            id: balancedID,
-            name: "均衡温控",
-            levels: TemperatureFanLevel.defaults
-        ),
-        TemperatureFanCurve(
-            id: UUID(uuidString: "00000000-0000-0000-0000-000000000103")!,
-            name: "强力散热",
-            levels: [
+        }
+        if curveID == balancedID {
+            return [
+                TemperatureFanLevel(threshold: 55, percent: 30),
+                TemperatureFanLevel(threshold: 65, percent: 45),
+                TemperatureFanLevel(threshold: 75, percent: 65),
+                TemperatureFanLevel(threshold: 85, percent: 85),
+                TemperatureFanLevel(threshold: 90, percent: 100),
+            ]
+        }
+        if curveID == strongID {
+            return [
                 TemperatureFanLevel(threshold: 50, percent: 35),
                 TemperatureFanLevel(threshold: 60, percent: 55),
                 TemperatureFanLevel(threshold: 70, percent: 75),
                 TemperatureFanLevel(threshold: 80, percent: 100),
             ]
+        }
+        return nil
+    }
+
+    static let defaults: [TemperatureFanCurve] = [
+        TemperatureFanCurve(
+            id: quietID,
+            name: "安静温控",
+            levels: defaultLevels(for: quietID)!
+        ),
+        TemperatureFanCurve(
+            id: balancedID,
+            name: "均衡温控",
+            levels: defaultLevels(for: balancedID)!
+        ),
+        TemperatureFanCurve(
+            id: strongID,
+            name: "强力散热",
+            levels: defaultLevels(for: strongID)!
         ),
     ]
 }
